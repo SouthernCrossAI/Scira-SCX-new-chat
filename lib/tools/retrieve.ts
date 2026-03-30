@@ -201,7 +201,7 @@ function formatSupadataResponse(metadata: SupadataMetadata, url: string, transcr
 }
 
 
-const supadata = new Supadata({ apiKey: serverEnv.SUPADATA_API_KEY });
+const supadata = new Supadata({ apiKey: serverEnv.SUPADATA_API_KEY ?? '' });
 const exa = new Exa(serverEnv.EXA_API_KEY as string);
 const parallel = new Parallel({ apiKey: serverEnv.PARALLEL_API_KEY });
 const firecrawl = new FirecrawlApp({ apiKey: serverEnv.FIRECRAWL_API_KEY });
@@ -553,6 +553,25 @@ export const retrieveTool = tool({
     live_crawl?: ('never' | 'auto' | 'preferred')[];
   }) => {
     const startTime = Date.now();
+
+    // Guard: Supabase private storage URLs cannot be accessed by external scrapers.
+    // When these URLs appear it means the user is asking about one of their uploaded
+    // files. Use the rag_search tool instead, which queries the pre-indexed chunks.
+    const supabaseUrls = url.filter((u) =>
+      /supabase\.(co|com)\/storage/i.test(u) || u.includes('/storage/v1/object/')
+    );
+    if (supabaseUrls.length > 0) {
+      return {
+        urls: url,
+        results: [],
+        sources: [] as string[],
+        response_time: 0,
+        error:
+          `Cannot retrieve private file storage URLs directly. ` +
+          `These files are stored in your document library and must be queried with the rag_search tool. ` +
+          `Please call rag_search with the user's question to search the content of the uploaded file(s).`,
+      };
+    }
 
     try {
       const urlCount = url.length;

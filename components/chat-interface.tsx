@@ -17,17 +17,22 @@ import { toast } from 'sonner';
 import { v7 as uuidv7 } from 'uuid';
 
 // Internal app imports
-import { suggestQuestions, updateChatVisibility, getChatMeta } from '@/app/actions';
+import { suggestQuestions, updateChatVisibility, getChatMeta, hasAcceptedTerms/*, getHomeSuggestions*/ } from '@/app/actions';
+import { ExamplePrompts } from '@/components/chat-interface-components';
+import { ExampleCategories } from '@/components/example-categories';
+import { DynamicGreeting } from '@/components/dynamic-greeting';
+import { CodePreviewProvider, useCodePreview } from '@/hooks/use-code-preview';
+import { CodePreviewPanel } from '@/components/code-preview-panel';
 
 // Component imports
 import { ChatDialogs } from '@/components/chat-dialogs';
+import { TermsAcceptanceModal } from '@/components/terms-acceptance-modal';
 import Messages from '@/components/messages';
 import { AppSidebar } from '@/components/app-sidebar';
 import { SidebarInset, useSidebar, SidebarTrigger } from '@/components/ui/sidebar';
 import { Button } from '@/components/ui/button';
 import FormComponent from '@/components/ui/form-component';
 import { ShareDialog } from '@/components/share/share-dialog';
-import { ExampleCategories } from '@/components/example-categories';
 import { Pencil, Trash2, Share as ShareIcon, ChevronDown } from 'lucide-react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Input } from '@/components/ui/input';
@@ -56,6 +61,7 @@ import {
 import { useAutoResume } from '@/hooks/use-auto-resume';
 import { useLocalStorage } from '@/hooks/use-local-storage';
 import { useUsageData } from '@/hooks/use-usage-data';
+import { useBrowserLocation } from '@/hooks/use-browser-location';
 import { useUser } from '@/contexts/user-context';
 import { useOptimizedScroll } from '@/hooks/use-optimized-scroll';
 
@@ -63,7 +69,7 @@ import { useOptimizedScroll } from '@/hooks/use-optimized-scroll';
 import { SEARCH_LIMITS } from '@/lib/constants';
 import { ChatSDKError } from '@/lib/errors';
 import { cn, SearchGroupId } from '@/lib/utils';
-import { requiresProSubscription } from '@/ai/providers';
+import { DEFAULT_MODEL, models, supportsFunctionCalling, requiresProSubscription } from '@/ai/models';
 import { ConnectorProvider } from '@/lib/connectors';
 
 // State management imports
@@ -142,7 +148,7 @@ const ChatInterface = memo(
       queueMicrotask(() => measureHeaderMenuAlignment());
     }, [pathname, localChatTitle, headerMenuOpen, measureHeaderMenuAlignment]);
 
-    const [selectedModel, setSelectedModel] = useLocalStorage('scira-selected-model', 'scira-default');
+    const [selectedModel, setSelectedModel] = useLocalStorage('scira-selected-model', DEFAULT_MODEL);
     const initialGroupDefault = (
       groupParam ? (groupParam as unknown as SearchGroupId) : ('web' as SearchGroupId)
     ) as SearchGroupId;
@@ -162,6 +168,10 @@ const ChatInterface = memo(
     // Settings page navigation (replaces dialog/hash approach)
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [settingsInitialTab, setSettingsInitialTab] = useState<string>('profile');
+
+    // Home screen suggestion prompts — temporarily disabled
+    // const [homeSuggestions, setHomeSuggestions] = useState<{ text: string; category?: string }[] | null>(null);
+    // const [suggestionsLoading, setSuggestionsLoading] = useState(true);
 
     const handleOpenSettings = useCallback(
       (tab: string = 'profile') => {
@@ -212,6 +222,26 @@ const ChatInterface = memo(
       shouldBypassLimitsForModel,
     } = useUser();
 
+    const [showTermsModal, setShowTermsModal] = useState(false);
+
+    // Show the Terms Acceptance Modal once per session for authenticated Pro users who haven't accepted yet
+    useEffect(() => {
+      if (!user || proStatusLoading) return;
+
+      let cancelled = false;
+      hasAcceptedTerms()
+        .then((accepted) => {
+          if (!cancelled && !accepted) {
+            setShowTermsModal(true);
+          }
+        })
+        .catch(() => {
+          // Fail open — don't block the user if the check fails
+        });
+
+      return () => { cancelled = true; };
+    }, [user, proStatusLoading]);
+
     const { setDataStream } = useDataStream();
 
     const initialState = useMemo(
@@ -228,6 +258,13 @@ const ChatInterface = memo(
         if (!isEditingTitle) setTitleInput(chatTitle);
       }
     }, [chatTitle]);
+
+    useEffect(() => {
+      const isNewChat = !initialChatId && localChatTitle === 'New Chat';
+      document.title = isNewChat ? 'SCX.ai' : `${localChatTitle} | SCX.ai`;
+      return () => { document.title = 'SCX.ai'; };
+    }, [localChatTitle, initialChatId]);
+
 
     const handleStartEditTitle = useCallback(() => {
       const currentChatId = initialChatId || (pathname?.startsWith('/search/') ? pathname.split('/')[2] : null);
@@ -317,6 +354,9 @@ const ChatInterface = memo(
     // Use clean React Query hooks for all data fetching
     const { data: usageData } = useUsageData(user || null);
 
+    // Browser GPS location — requested non-blockingly on first message send
+    const { requestLocation } = useBrowserLocation();
+
     // Sign-in prompt timer
     const signInTimerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -356,17 +396,26 @@ const ChatInterface = memo(
       extremeSearchCountExhausted
     );
 
+    // Guard: if the stored model no longer exists in the models list (e.g. a model
+    // was removed, or localStorage has a legacy value like 'scira-default'), reset
+    // immediately to DEFAULT_MODEL so the UI always shows a valid selection.
+    useEffect(() => {
+      const modelExists = models.some((m) => m.value === selectedModel);
+      if (!modelExists) {
+        console.log(`[model-guard] '${selectedModel}' not in models list — resetting to '${DEFAULT_MODEL}'`);
+        setSelectedModel(DEFAULT_MODEL);
+      }
+    }, [selectedModel, setSelectedModel]);
+
     // Auto-switch away from pro models when user loses pro access
     useEffect(() => {
       if (proStatusLoading) return;
 
       const currentModelRequiresPro = requiresProSubscription(selectedModel);
 
-      // If current model requires pro but user is not pro, switch to default
-      // Also prevent infinite loops by ensuring we're not already on the default model
-      if (currentModelRequiresPro && !isUserPro && selectedModel !== 'scira-default') {
-        console.log(`Auto-switching from pro model '${selectedModel}' to 'scira-default' - user lost pro access`);
-        setSelectedModel('scira-default');
+      if (currentModelRequiresPro && !isUserPro && selectedModel !== DEFAULT_MODEL) {
+        console.log(`Auto-switching from pro model '${selectedModel}' to '${DEFAULT_MODEL}' - user lost pro access`);
+        setSelectedModel(DEFAULT_MODEL);
       }
     }, [selectedModel, isUserPro, proStatusLoading, setSelectedModel]);
 
@@ -442,8 +491,24 @@ const ChatInterface = memo(
       // resume: true,
       transport: new DefaultChatTransport({
         api: '/api/search',
-        prepareSendMessagesRequest({ messages, body }) {
-          // Use ref values to get current state
+        async prepareSendMessagesRequest({ messages, body }) {
+          // Only request browser GPS when the selected model can actually use location-based
+          // tools (e.g. weather, maps, nearby places). Coding/reasoning-only models have no
+          // tools and must never trigger the browser permission dialog.
+          let browserLat: number | undefined;
+          let browserLon: number | undefined;
+          if (supportsFunctionCalling(selectedModelRef.current)) {
+            try {
+              const loc = await requestLocation();
+              if (loc) {
+                browserLat = loc.lat;
+                browserLon = loc.lon;
+              }
+            } catch {
+              // Silently ignore — IP geolocation on server is the fallback
+            }
+          }
+
           return {
             body: {
               id: chatId,
@@ -455,6 +520,9 @@ const ChatInterface = memo(
               searchProvider: searchProviderRef.current,
               extremeSearchProvider: extremeSearchProviderRef.current,
               selectedConnectors: selectedConnectorsRef.current,
+              ...(browserLat !== undefined && browserLon !== undefined
+                ? { browserLat, browserLon }
+                : {}),
               ...(initialChatId ? { chat_id: initialChatId } : {}),
               ...body,
             },
@@ -480,6 +548,38 @@ const ChatInterface = memo(
       },
       onFinish: async ({ message }) => {
         console.log('onFinish<Client>', message.parts);
+
+        // If this is a new chat, do the proper Next.js navigation to /search/[chatId].
+        // The URL was already updated via replaceState when the first message was sent,
+        // but we still need router.replace so Next.js loads server components and
+        // initialMessages from DB (for future remounts, resumable-stream, etc.).
+        if (!initialChatId) {
+          const navigateToChat = () => {
+            router.replace(`/search/${chatId}`);
+            // Still invalidate queries so the sidebar refreshes on the new page
+            if (user) {
+              queryClient.invalidateQueries({ queryKey: ['user-usage', user.id] });
+              queryClient.refetchQueries({ queryKey: ['recent-chats', user.id] });
+            }
+          };
+
+          if (document.hidden) {
+            // User switched to another tab while the stream was completing.
+            // Defer the navigation until they return to avoid silently changing
+            // the URL under them while they are away.
+            const onVisible = () => {
+              if (!document.hidden) {
+                navigateToChat();
+                document.removeEventListener('visibilitychange', onVisible);
+              }
+            };
+            document.addEventListener('visibilitychange', onVisible);
+          } else {
+            navigateToChat();
+          }
+          return;
+        }
+
         // Refresh usage data after message completion for authenticated users
         if (user) {
           // Invalidate usage data to force fresh fetch and update tooltips
@@ -512,14 +612,18 @@ const ChatInterface = memo(
         // Only generate suggested questions if authenticated user or private chat
         if (message.parts && message.role === 'assistant' && (user || chatState.selectedVisibilityType === 'private')) {
           const lastPart = message.parts[message.parts.length - 1];
-          const lastPartText = lastPart.type === 'text' ? lastPart.text : '';
+          const lastPartText = lastPart?.type === 'text' ? lastPart.text : '';
           const newHistory = [
             { role: 'user', content: lastSubmittedQueryRef.current },
             { role: 'assistant', content: lastPartText },
           ];
           console.log('newHistory', newHistory);
-          const { questions } = await suggestQuestions(newHistory);
-          dispatch({ type: 'SET_SUGGESTED_QUESTIONS', payload: questions });
+          try {
+            const { questions } = await suggestQuestions(newHistory);
+            dispatch({ type: 'SET_SUGGESTED_QUESTIONS', payload: questions });
+          } catch (error) {
+            console.error('Error generating suggested questions:', error);
+          }
         }
       },
       onError: (error) => {
@@ -593,8 +697,10 @@ const ChatInterface = memo(
     useAutoResume({
       autoResume: true,
       initialMessages: initialMessages || [],
+      messages: messages as ChatMessage[],
       resumeStream,
       setMessages,
+      status,
     });
 
     useEffect(() => {
@@ -602,6 +708,52 @@ const ChatInterface = memo(
         console.log('[status]:', status);
       }
     }, [status]);
+
+    // As soon as the first message appears for a new chat, silently update the URL
+    // to /search/[chatId] via replaceState (no React remount, no stream interruption).
+    // This means if the browser discards the tab or the user closes the window, a
+    // reload will come back to the correct URL — not the blank home page.
+    useEffect(() => {
+      if (
+        !initialChatId &&
+        messages.length > 0 &&
+        typeof window !== 'undefined' &&
+        window.location.pathname === '/'
+      ) {
+        window.history.replaceState(null, '', `/search/${chatId}`);
+      }
+    }, [initialChatId, messages.length, chatId]);
+
+    // When the user returns to the tab, try to reconnect an interrupted stream.
+    // The browser suspends SSE connections in backgrounded tabs; on resume the
+    // hook is stuck in 'streaming'/'submitted' but receiving no data.
+    // Calling resumeStream() re-establishes the connection so the response
+    // continues (or replays the finished response from the resumable-stream store).
+    useEffect(() => {
+      const handleVisibilityChange = () => {
+        if (document.hidden) return;
+        if (status === 'streaming' || status === 'submitted') {
+          console.log('[visibility] Tab restored with stuck status:', status, '— attempting resume');
+          resumeStream();
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }, [status, resumeStream]);
+
+    // Watchdog: if status stays 'submitted' or 'streaming' for more than 90 seconds
+    // without transitioning to 'ready' (e.g. silent TCP disconnect, Vercel timeout),
+    // call stop() to reset the UI so the user isn't locked out indefinitely.
+    useEffect(() => {
+      if (status !== 'submitted' && status !== 'streaming') return;
+
+      const watchdog = setTimeout(() => {
+        console.warn('[watchdog] Status stuck at', status, 'for 90s — calling stop()');
+        stop();
+      }, 90_000);
+
+      return () => clearTimeout(watchdog);
+    }, [status, stop]);
 
     // Removed header/recents invalidation effects; chat meta now refetches based on messages.length via query key
 
@@ -698,6 +850,37 @@ const ChatInterface = memo(
       }
     }, [messages, status, scrollToBottom]);
 
+    // Restore attachments passed from the /files page via localStorage
+    useEffect(() => {
+      if (typeof window === 'undefined') return;
+      if (chatState.attachments.length > 0) return;
+
+      try {
+        const storedAttachments = localStorage.getItem('initial-attachments');
+        if (storedAttachments) {
+          const parsed = JSON.parse(storedAttachments);
+          if (Array.isArray(parsed) && parsed.length) {
+            dispatch({ type: 'SET_ATTACHMENTS', payload: parsed });
+          }
+          localStorage.removeItem('initial-attachments');
+          return;
+        }
+
+        const storedAttachment = localStorage.getItem('initial-attachment');
+        if (storedAttachment) {
+          const parsed = JSON.parse(storedAttachment);
+          if (parsed) {
+            dispatch({ type: 'SET_ATTACHMENTS', payload: [parsed] });
+          }
+          localStorage.removeItem('initial-attachment');
+        }
+      } catch (err) {
+        console.error('Failed to restore attachments from localStorage', err);
+        localStorage.removeItem('initial-attachments');
+        localStorage.removeItem('initial-attachment');
+      }
+    }, [chatState.attachments.length, dispatch]);
+
     // Dialog management state - track command dialog state in chat state
     useEffect(() => {
       dispatch({
@@ -739,6 +922,56 @@ const ChatInterface = memo(
     const resetSuggestedQuestions = useCallback(() => {
       dispatch({ type: 'RESET_SUGGESTED_QUESTIONS' });
     }, []);
+
+    // Fetch dynamic home suggestions — temporarily disabled to avoid unnecessary compute
+    // useEffect(() => {
+    //   const showPrompts =
+    //     status === 'ready' &&
+    //     messages.length === 0 &&
+    //     ((user && isOwner) || !initialChatId || (!user && chatState.selectedVisibilityType === 'private')) &&
+    //     !isLimitBlocked;
+    //
+    //   if (!showPrompts) {
+    //     setSuggestionsLoading(false);
+    //     setHomeSuggestions(null);
+    //     return;
+    //   }
+    //
+    //   let cancelled = false;
+    //   setSuggestionsLoading(true);
+    //   setHomeSuggestions(null);
+    //
+    //   getHomeSuggestions(selectedModel, isUserPro)
+    //     .then((suggestions) => {
+    //       if (!cancelled && Array.isArray(suggestions) && suggestions.length > 0) {
+    //         setHomeSuggestions(suggestions);
+    //       }
+    //     })
+    //     .catch(() => {
+    //       if (!cancelled) {
+    //         setHomeSuggestions(null);
+    //       }
+    //     })
+    //     .finally(() => {
+    //       if (!cancelled) {
+    //         setSuggestionsLoading(false);
+    //       }
+    //     });
+    //
+    //   return () => {
+    //     cancelled = true;
+    //   };
+    // }, [
+    //   status,
+    //   messages.length,
+    //   user,
+    //   isOwner,
+    //   initialChatId,
+    //   chatState.selectedVisibilityType,
+    //   isLimitBlocked,
+    //   selectedModel,
+    //   isUserPro,
+    // ]);
 
     // Handle example selection from ExampleCategories
     const handleExampleSelect = useCallback(
@@ -828,7 +1061,8 @@ const ChatInterface = memo(
     );
 
     return (
-      <>
+      <CodePreviewProvider>
+        <PreviewEventBridge />
         <AppSidebar
           chatId={initialChatId || (messages.length > 0 ? chatId : null)}
           selectedVisibilityType={chatState.selectedVisibilityType}
@@ -1031,15 +1265,19 @@ const ChatInterface = memo(
                 dispatch({ type: 'SET_HAS_SHOWN_UPGRADE_DIALOG', payload: value });
                 setPersitedHasShownUpgradeDialog(value);
               }}
-              showLookoutAnnouncement={chatState.showAnnouncementDialog}
-              setShowLookoutAnnouncement={(open) => dispatch({ type: 'SET_SHOW_ANNOUNCEMENT_DIALOG', payload: open })}
-              hasShownLookoutAnnouncement={chatState.hasShownAnnouncementDialog}
-              setHasShownLookoutAnnouncement={(value) => {
-                dispatch({ type: 'SET_HAS_SHOWN_ANNOUNCEMENT_DIALOG', payload: value });
-                setPersitedHasShownLookoutAnnouncement(value);
-              }}
+              showLookoutAnnouncement={false}
+              setShowLookoutAnnouncement={() => {}}
+              hasShownLookoutAnnouncement={true}
+              setHasShownLookoutAnnouncement={() => {}}
               user={user}
               setAnyDialogOpen={(open) => dispatch({ type: 'SET_ANY_DIALOG_OPEN', payload: open })}
+            />
+
+            <TermsAcceptanceModal
+              open={showTermsModal}
+              onOpenChange={setShowTermsModal}
+              onAccept={() => setShowTermsModal(false)}
+              onDecline={() => setShowTermsModal(false)}
             />
 
             <div
@@ -1050,39 +1288,64 @@ const ChatInterface = memo(
             >
               <div className={`w-full max-w-[95%] sm:max-w-2xl space-y-6 p-0 mx-auto transition-all duration-300`}>
                 {status === 'ready' && messages.length === 0 && (
-                  <div className="text-center m-0 mb-2">
-                    {/* Mobile sidebar trigger for main page */}
-                    <div className="md:hidden absolute top-4 left-4 z-10">
+                  <div className="text-center m-0 mb-4 relative">
+                    {/* Mobile sidebar trigger */}
+                    <div className="md:hidden absolute top-0 left-0 z-10">
                       <SidebarTrigger />
                     </div>
-                    {/* Mobile New Chat button for initial state */}
-                    <div className="md:hidden absolute top-4 right-4 z-10">
+                    {/* Mobile New Chat button */}
+                    <div className="md:hidden absolute top-0 right-0 z-10">
                       <Link href="/new">
                         <Button
                           type="button"
                           variant="secondary"
                           size="sm"
-                          className="rounded-lg bg-accent hover:bg-accent/80 group transition-all hover:scale-105 pointer-events-auto"
+                          className="rounded-lg bg-muted hover:bg-primary/10 hover:border-primary/30 border border-border group transition-all duration-150 pointer-events-auto"
                         >
-                          <PlusIcon size={16} className="group-hover:rotate-90 transition-all" />
-                          <span className="text-sm ml-1.5 group-hover:block hidden animate-in fade-in duration-300">
-                            New
-                          </span>
+                          <PlusIcon size={16} className="group-hover:rotate-90 transition-transform duration-200 group-hover:text-primary" />
                         </Button>
                       </Link>
                     </div>
-                    <div className="inline-flex items-center gap-3">
-                      <h1 className="text-4xl sm:text-5xl mb-0! text-foreground dark:text-foreground font-be-vietnam-pro! font-light tracking-tighter">
-                        scira
+
+                    {/* Ambient glow */}
+                    <div aria-hidden className="pointer-events-none absolute inset-x-0 -top-20 -z-10 flex justify-center">
+                      <div className="h-56 w-[480px] rounded-full bg-primary/7 blur-3xl dark:bg-primary/10" />
+                    </div>
+
+                    {/* Badge pill */}
+                    <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/6 px-3.5 py-1 text-[11px] font-medium text-primary mb-6 tracking-wide">
+                      <span className="size-1.5 rounded-full bg-primary animate-pulse" />
+                      Sovereign Australian AI
+                      <span className="text-primary/40">·</span>
+                      Powered by MAGPiE
+                    </div>
+
+                    {/* Title — dynamic, context-aware greeting */}
+                    <div className="flex items-center justify-center gap-3 mb-4">
+                      <h1
+                        className={[
+                          'font-bold tracking-tight text-foreground neon-glow leading-[1.08]',
+                          user?.name
+                            ? 'text-3xl sm:text-4xl md:text-[2.75rem]'
+                            : 'text-5xl sm:text-[3.75rem]',
+                        ].join(' ')}
+                      >
+                        <DynamicGreeting
+                          user={{ name: user?.name ?? undefined }}
+                          showEmoji={false}
+                          animated
+                        />
                       </h1>
                       {isUserPro && (
-                        <h1 className="text-2xl font-baumans! leading-4 inline-block px-3! pt-1! pb-2.5! rounded-xl shadow-sm m-0! mt-2! bg-linear-to-br from-secondary/25 via-primary/20 to-accent/25 text-foreground ring-1 ring-ring/35 ring-offset-1 ring-offset-background dark:bg-linear-to-br dark:from-primary dark:via-secondary dark:to-primary dark:text-foreground">
+                        <span className="text-[10px] font-semibold tracking-widest uppercase px-2 py-0.5 rounded border border-primary/30 bg-primary/10 text-primary self-end mb-2 dark:neon-glow-box">
                           pro
-                        </h1>
+                        </span>
                       )}
                     </div>
+
                   </div>
                 )}
+
 
                 {/* Show initial limit exceeded message */}
                 {status === 'ready' && messages.length === 0 && isLimitBlocked && (
@@ -1230,15 +1493,9 @@ const ChatInterface = memo(
                       usageData={usageData ? { messageCount: usageData.messageCount, extremeSearchCount: usageData.extremeSearchCount, error: usageData.error } : undefined}
                     />
 
-                    {/* Example Categories - show only on initial state */}
-                    {messages.length === 0 && !chatState.hasSubmitted && (
-                      <ExampleCategories
-                        onSelectExample={handleExampleSelect}
-                        className="mt-5"
-                      />
-                    )}
                   </div>
                 )}
+
 
               {/* Form backdrop overlay - hides content below form when in submitted mode */}
               {((user && isOwner) || !initialChatId || (!user && chatState.selectedVisibilityType === 'private')) &&
@@ -1373,10 +1630,32 @@ const ChatInterface = memo(
             </AlertDialogContent>
           </AlertDialog>
         )}
-      </>
+        <CodePreviewPanel />
+      </CodePreviewProvider>
     );
   },
 );
+
+function PreviewEventBridge() {
+  const { openPreview } = useCodePreview();
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        url?: string;
+        title?: string;
+        srcdoc?: string;
+      };
+      if (detail?.url || detail?.srcdoc) {
+        openPreview(detail.url || '', detail.title, detail.srcdoc);
+      }
+    };
+    window.addEventListener('scx-open-preview', handler);
+    return () => window.removeEventListener('scx-open-preview', handler);
+  }, [openPreview]);
+
+  return null;
+}
 
 // Add a display name for the memoized component for better debugging
 ChatInterface.displayName = 'ChatInterface';

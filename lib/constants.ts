@@ -5,7 +5,7 @@ export const SEARCH_LIMITS = {
 } as const;
 
 export const PRICING = {
-  PRO_MONTHLY: 15, // USD
+  PRO_MONTHLY: 20, // USD
   PRO_MONTHLY_INR: 1330, // INR for Indian users
 } as const;
 
@@ -14,4 +14,6 @@ export const CURRENCIES = {
   INR: 'INR',
 } as const;
 
-export const SNAPSHOT_NAME = 'scira-analysis:1752127473';
+// Daytona snapshot for Python code execution
+// Using daytona-medium: 2 vCPU, 4 GiB RAM, 8 GiB disk — suitable for pandas/numpy/matplotlib workloads
+export const SNAPSHOT_NAME = 'daytona-medium';

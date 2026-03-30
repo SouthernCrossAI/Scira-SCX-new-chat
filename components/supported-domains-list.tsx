@@ -12,7 +12,6 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { toast } from 'sonner';
 import { Eye, Search, AlertCircle, RefreshCw } from 'lucide-react';
 import { getStudentDomainsAction } from '@/app/actions';
 
@@ -41,18 +40,11 @@ export function SupportedDomainsList({ className }: SupportedDomainsListProps) {
     try {
       const result = await getStudentDomainsAction();
       setDomainsData(result);
-
-      if (result.fallback && result.error) {
-        toast.error('Failed to load latest domains, showing fallback list');
-      } else if (result.fallback) {
-        toast.info('Showing basic domain list');
-      }
     } catch (error) {
       console.error('Failed to load domains:', error);
-      toast.error('Failed to load supported domains');
       setDomainsData({
         success: false,
-        domains: ['.edu', '.ac.in'],
+        domains: ['.edu', '.edu.au'],
         count: 2,
         fallback: true,
         error: 'Failed to load',
@@ -81,14 +73,14 @@ export function SupportedDomainsList({ className }: SupportedDomainsListProps) {
 
   const getDomainDisplayName = (domain: string) => {
     if (domain === '.edu') return 'US Educational Institutions (.edu)';
-    if (domain === '.ac.in') return 'Indian Academic Institutions (.ac.in)';
+    if (domain === '.edu.au') return 'Australian Educational Institutions (.edu.au)';
     if (domain.startsWith('.')) return `${domain} domains`;
     return domain;
   };
 
   const getDomainType = (domain: string) => {
     if (domain === '.edu') return 'US';
-    if (domain === '.ac.in') return 'India';
+    if (domain === '.edu.au') return 'AU';
     if (domain.includes('.edu')) return 'Educational';
     if (domain.includes('.ac.')) return 'Academic';
     return 'University';

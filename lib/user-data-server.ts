@@ -19,6 +19,16 @@ export type ComprehensiveUserData = {
   image: string | null;
   createdAt: Date;
   updatedAt: Date;
+  // Location fields from user schema
+  countryCode: string | null;
+  country: string | null;
+  city: string | null;
+  region: string | null;
+  latitude: string | null;
+  longitude: string | null;
+  timezone: string | null;
+  utcOffset: string | null;
+  locationUpdatedAt: Date | null;
   isProUser: boolean;
   proSource: 'polar' | 'dodo' | 'none';
   subscriptionStatus: 'active' | 'canceled' | 'expired' | 'none';
@@ -264,17 +274,21 @@ export async function getLightweightUserAuth(): Promise<LightweightUserAuth | nu
         isDodoActive = cachedDodoStatus.isProUser ?? cachedDodoStatus.hasSubscriptions ?? false;
       } else {
         // Cache miss: query DB (use maindb to avoid replication lag)
-        const recentDodoSubscription = await maindb
-          .select({
-            createdAt: dodosubscription.createdAt,
-            currentPeriodEnd: dodosubscription.currentPeriodEnd,
-            status: dodosubscription.status,
-            cancelAtPeriodEnd: dodosubscription.cancelAtPeriodEnd,
-          })
-          .from(dodosubscription)
-          .where(eq(dodosubscription.userId, userId))
-          .orderBy(desc(dodosubscription.createdAt))
-          .limit(1);
+        // Guard: table may not exist if DodoPayments is not configured
+        const recentDodoSubscription = process.env.DODO_PAYMENTS_API_KEY
+          ? await maindb
+              .select({
+                createdAt: dodosubscription.createdAt,
+                currentPeriodEnd: dodosubscription.currentPeriodEnd,
+                status: dodosubscription.status,
+                cancelAtPeriodEnd: dodosubscription.cancelAtPeriodEnd,
+              })
+              .from(dodosubscription)
+              .where(eq(dodosubscription.userId, userId))
+              .orderBy(desc(dodosubscription.createdAt))
+              .limit(1)
+              .catch(() => [])
+          : [];
 
         if (recentDodoSubscription.length > 0) {
           const sub = recentDodoSubscription[0];
@@ -345,6 +359,16 @@ export async function getComprehensiveUserData(): Promise<ComprehensiveUserData 
         image: user.image,
         userCreatedAt: user.createdAt,
         userUpdatedAt: user.updatedAt,
+        // Location fields
+        countryCode: user.countryCode,
+        country: user.country,
+        city: user.city,
+        region: user.region,
+        latitude: user.latitude,
+        longitude: user.longitude,
+        timezone: user.timezone,
+        utcOffset: user.utcOffset,
+        locationUpdatedAt: user.locationUpdatedAt,
         // Subscription fields (will be null if no subscription)
         subscriptionId: subscription.id,
         subscriptionCreatedAt: subscription.createdAt,
@@ -370,27 +394,34 @@ export async function getComprehensiveUserData(): Promise<ComprehensiveUserData 
 
     // Fetch Dodo subscription data separately with optimized query
     // IMPORTANT: Use maindb for critical subscription queries to avoid replication lag
-    const dodoSubscriptions = await maindb
-      .select({
-        id: dodosubscription.id,
-        createdAt: dodosubscription.createdAt,
-        status: dodosubscription.status,
-        amount: dodosubscription.amount,
-        currency: dodosubscription.currency,
-        interval: dodosubscription.interval,
-        intervalCount: dodosubscription.intervalCount,
-        currentPeriodStart: dodosubscription.currentPeriodStart,
-        currentPeriodEnd: dodosubscription.currentPeriodEnd,
-        cancelledAt: dodosubscription.cancelledAt,
-        cancelAtPeriodEnd: dodosubscription.cancelAtPeriodEnd,
-        endedAt: dodosubscription.endedAt,
-        productId: dodosubscription.productId,
-      })
-      .from(dodosubscription)
-      .where(eq(dodosubscription.userId, userId));
+    // Guard: table may not exist if DodoPayments is not configured
+    const dodoSubscriptions = process.env.DODO_PAYMENTS_API_KEY
+      ? await maindb
+          .select({
+            id: dodosubscription.id,
+            createdAt: dodosubscription.createdAt,
+            status: dodosubscription.status,
+            amount: dodosubscription.amount,
+            currency: dodosubscription.currency,
+            interval: dodosubscription.interval,
+            intervalCount: dodosubscription.intervalCount,
+            currentPeriodStart: dodosubscription.currentPeriodStart,
+            currentPeriodEnd: dodosubscription.currentPeriodEnd,
+            cancelledAt: dodosubscription.cancelledAt,
+            cancelAtPeriodEnd: dodosubscription.cancelAtPeriodEnd,
+            endedAt: dodosubscription.endedAt,
+            productId: dodosubscription.productId,
+          })
+          .from(dodosubscription)
+          .where(eq(dodosubscription.userId, userId))
+          .catch(() => [])
+      : [];
 
     // Calculate expiration info from subscriptions
-    const dodoExpirationInfo = await getDodoSubscriptionExpirationInfo({ userId });
+    // getDodoSubscriptionExpirationInfo has its own try-catch and returns null on error
+    const dodoExpirationInfo = process.env.DODO_PAYMENTS_API_KEY
+      ? await getDodoSubscriptionExpirationInfo({ userId })
+      : null;
 
     // Process Polar subscriptions from the joined data
     const polarSubscriptions = userWithSubscriptions
@@ -495,6 +526,15 @@ export async function getComprehensiveUserData(): Promise<ComprehensiveUserData 
       image: userData.image,
       createdAt: userData.userCreatedAt,
       updatedAt: userData.userUpdatedAt,
+      countryCode: userData.countryCode ?? null,
+      country: userData.country ?? null,
+      city: userData.city ?? null,
+      region: userData.region ?? null,
+      latitude: userData.latitude ?? null,
+      longitude: userData.longitude ?? null,
+      timezone: userData.timezone ?? null,
+      utcOffset: userData.utcOffset ?? null,
+      locationUpdatedAt: userData.locationUpdatedAt ?? null,
       isProUser,
       proSource,
       subscriptionStatus,

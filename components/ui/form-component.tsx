@@ -7,6 +7,7 @@ import { Button } from '../ui/button';
 import { Textarea } from '../ui/textarea';
 import {
   models,
+  DEFAULT_MODEL,
   requiresAuthentication,
   requiresProSubscription,
   hasVisionSupport,
@@ -16,8 +17,9 @@ import {
   getFilteredModels,
   isModelRestrictedInRegion,
   supportsExtremeMode,
-} from '@/ai/providers';
-import { X, Check, Wand2, Upload, CheckIcon, Zap, Sparkles, ArrowUpRight } from 'lucide-react';
+  supportsFunctionCalling,
+} from '@/ai/models';
+import { X, Check, Wand2, Upload, CheckIcon, Zap, Sparkles, ArrowUpRight, Info } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle, DialogHeader, DialogDescription } from '@/components/ui/dialog';
 import { cn, SearchGroup, SearchGroupId, getSearchGroups, SearchProvider } from '@/lib/utils';
 
@@ -25,7 +27,7 @@ import { track } from '@vercel/analytics';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Kbd, KbdGroup } from '@/components/ui/kbd';
 import { ComprehensiveUserData } from '@/hooks/use-user-data';
-import { checkImageModeration, enhancePrompt, getDiscountConfigAction, getUserCountryCode } from '@/app/actions';
+import { checkImageModeration, checkTextModeration, enhancePrompt, getDiscountConfigAction, getUserCountryCode } from '@/app/actions';
 import { DiscountConfig } from '@/lib/discount';
 import { PRICING, SEARCH_LIMITS } from '@/lib/constants';
 import { LockIcon, Eye, Brain, FilePdf } from '@phosphor-icons/react';
@@ -101,9 +103,13 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
 
     // Fetch country code on mount
     useEffect(() => {
-      getUserCountryCode().then((code) => {
-        setCountryCode(code);
-      });
+      getUserCountryCode()
+        .then((code) => {
+          setCountryCode(code);
+        })
+        .catch(() => {
+          // Non-critical: falls back to unfiltered model list
+        });
     }, []);
 
     const availableModels = useMemo(() => getFilteredModels(countryCode || undefined), [countryCode]);
@@ -472,19 +478,18 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
       const isCurrentModelRestricted = isModelRestrictedInRegion(selectedModel, countryCode || undefined);
 
       // If current model is restricted in user's region, switch to default
-      if (isCurrentModelRestricted && selectedModel !== 'scira-default') {
+      if (isCurrentModelRestricted && selectedModel !== DEFAULT_MODEL) {
         console.log(
-          `Auto-switching from restricted model '${selectedModel}' to 'scira-default' - model not available in region ${countryCode}`,
+          `Auto-switching from restricted model '${selectedModel}' to '${DEFAULT_MODEL}' - model not available in region ${countryCode}`,
         );
-        setSelectedModel('scira-default');
+        setSelectedModel(DEFAULT_MODEL);
         return;
       }
 
       // If current model requires pro but user is not pro, switch to default
-      // Also prevent infinite loops by ensuring we're not already on the default model
-      if (currentModelExists && currentModelRequiresPro && !isProUser && selectedModel !== 'scira-default') {
-        console.log(`Auto-switching from pro model '${selectedModel}' to 'scira-default' - user lost pro access`);
-        setSelectedModel('scira-default');
+      if (currentModelExists && currentModelRequiresPro && !isProUser && selectedModel !== DEFAULT_MODEL) {
+        console.log(`Auto-switching from pro model '${selectedModel}' to '${DEFAULT_MODEL}' - user lost pro access`);
+        setSelectedModel(DEFAULT_MODEL);
       }
     }, [selectedModel, isProUser, isSubscriptionLoading, setSelectedModel, availableModels, countryCode]);
 
@@ -516,11 +521,18 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
         console.log('Selected model:', model.value);
         setSelectedModel(model.value.trim());
 
+        // Notify user when switching from a no-attachment model (Magpie) to one that supports files
+        const fromNoAttachments = selectedModel === 'magpie' || selectedModel === 'magpie-legal';
+        const toSupportsAttachments = model.value !== 'magpie' && model.value !== 'magpie-legal';
+        if (fromNoAttachments && toSupportsAttachments) {
+          toast.info('You can now attach files and photos with this model');
+        }
+
         if (onModelSelect) {
           onModelSelect(model);
         }
       },
-      [availableModels, user, isProUser, isSubscriptionLoading, setSelectedModel, onModelSelect, fetchDiscountConfig],
+      [availableModels, user, isProUser, isSubscriptionLoading, setSelectedModel, onModelSelect, fetchDiscountConfig, selectedModel],
     );
 
     // Shared command content renderer (not a component) to preserve focus
@@ -550,6 +562,27 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
                   const requiresAuth = requiresAuthentication(model.value) && !user;
                   const requiresPro = requiresProSubscription(model.value) && !isProUser;
                   const isLocked = requiresAuth || requiresPro;
+
+                  if (model.comingSoon) {
+                    return (
+                      <div
+                        key={model.value}
+                        className={cn(
+                          'flex items-center justify-between px-2 py-1.5 mb-0.5 rounded-lg text-xs',
+                          'opacity-40 cursor-not-allowed select-none',
+                        )}
+                      >
+                        <div className="flex items-center gap-1 min-w-0 flex-1">
+                          <div className={cn('font-medium truncate flex-1', isMobile ? 'text-sm' : 'text-[11px]')}>
+                            {model.label}
+                          </div>
+                        </div>
+                        <span className={cn('text-muted-foreground font-medium shrink-0 ml-2', isMobile ? 'text-xs' : 'text-[10px]')}>
+                          Coming soon
+                        </span>
+                      </div>
+                    );
+                  }
 
                   if (isLocked) {
                     return (
@@ -765,6 +798,27 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
                     const requiresAuth = requiresAuthentication(model.value) && !user;
                     const requiresPro = requiresProSubscription(model.value) && !isProUser;
                     const isLocked = requiresAuth || requiresPro;
+
+                    if (model.comingSoon) {
+                      return (
+                        <div
+                          key={model.value}
+                          className={cn(
+                            'flex items-center justify-between px-2 py-1.5 mb-0.5 rounded-lg text-xs',
+                            'opacity-40 cursor-not-allowed select-none',
+                          )}
+                        >
+                          <div className="flex items-center gap-1 min-w-0 flex-1">
+                            <div className={cn('font-medium truncate flex-1', isMobile ? 'text-sm' : 'text-[11px]')}>
+                              {model.label}
+                            </div>
+                          </div>
+                          <span className={cn('text-muted-foreground font-medium shrink-0 ml-2', isMobile ? 'text-xs' : 'text-[10px]')}>
+                            Coming soon
+                          </span>
+                        </div>
+                      );
+                    }
 
                     if (isLocked) {
                       return (
@@ -1058,7 +1112,7 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
                         </>
                       ) : (
                         <div className="flex items-center gap-3 flex-wrap">
-                          <span className="text-xl sm:text-2xl font-be-vietnam-pro">Scira</span>
+                          <span className="text-xl sm:text-2xl font-be-vietnam-pro">SCX.ai</span>
                           <ProBadge className="text-white! bg-white/20! ring-white/30! font-extralight!" />
                         </div>
                       )}
@@ -1138,7 +1192,7 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
               <div className="flex items-center gap-4">
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div className="space-y-1">
-                  <p className="text-sm font-medium text-foreground">Scira Lookout</p>
+                  <p className="text-sm font-medium text-foreground">SCX.ai Lookout</p>
                   <p className="text-xs text-muted-foreground">Automated search monitoring on your schedule</p>
                 </div>
               </div>
@@ -1214,8 +1268,8 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
               <div className="flex items-center gap-4">
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div>
-                  <p className="text-sm font-medium text-foreground">Access better models</p>
-                  <p className="text-xs text-muted-foreground">GPT-5 Nano and more premium models</p>
+                  <p className="text-sm font-medium text-foreground">Access more models</p>
+                  <p className="text-xs text-muted-foreground">GPT-OSS 120B, SCX Coder, MAGPiE and more</p>
                 </div>
               </div>
 
@@ -1231,7 +1285,7 @@ const ModelSwitcher: React.FC<ModelSwitcherProps> = React.memo(
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div>
                   <p className="text-sm font-medium text-foreground">Free to start</p>
-                  <p className="text-xs text-muted-foreground">No payment required for basic features</p>
+                  <p className="text-xs text-muted-foreground">No payment required — Llama 4 is always free</p>
                 </div>
               </div>
 
@@ -2393,6 +2447,16 @@ const FormComponent: React.FC<FormComponentProps> = ({
 
   const hasInteracted = useMemo(() => messages.length > 0, [messages.length]);
 
+  const isMagpieModel = useMemo(
+    () => selectedModel === 'magpie' || selectedModel === 'magpie-legal',
+    [selectedModel],
+  );
+
+  const modelSupportsFunctionCalling = useMemo(
+    () => supportsFunctionCalling(selectedModel),
+    [selectedModel],
+  );
+
   const cleanupMediaRecorder = useCallback(() => {
     if (mediaRecorderRef.current?.stream) {
       mediaRecorderRef.current.stream.getTracks().forEach((track) => track.stop());
@@ -2643,12 +2707,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
       cleanupMediaRecorder();
     } else {
       try {
-        // Check if user is signed in
-        if (!user) {
-          setShowSignInDialog(true);
-          return;
-        }
-
         // Environment and feature checks
         if (typeof window === 'undefined') {
           toast.error('Voice recording is only available in the browser.');
@@ -2797,8 +2855,8 @@ const FormComponent: React.FC<FormComponentProps> = ({
           });
 
           if (extremeModels.length > 0) {
-            // Prioritize: scira-default if available, otherwise first free model, then first available
-            const defaultModel = extremeModels.find((m) => m.value === 'scira-default');
+            // Prioritize: DEFAULT_MODEL if it supports extreme, otherwise first free model, then first available
+            const defaultModel = extremeModels.find((m) => m.value === DEFAULT_MODEL);
             const firstFreeModel = extremeModels.find((m) => !m.pro);
             const fallbackModel = extremeModels[0];
 
@@ -2923,28 +2981,13 @@ const FormComponent: React.FC<FormComponentProps> = ({
         return;
       }
 
-      const currentModelData = models.find((m) => m.value === selectedModel);
-      if (pdfFiles.length > 0 && (!currentModelData || !currentModelData.pdf)) {
-        console.log('PDFs detected, switching to compatible model');
-
-        const compatibleModel = models.find((m) => m.pdf && m.vision);
-
-        if (compatibleModel) {
-          console.log('Switching to compatible model:', compatibleModel.value);
-          setSelectedModel(compatibleModel.value);
-        } else {
-          console.warn('No PDF-compatible model found');
-          toast.error('PDFs are only supported by Gemini and Claude models');
-
-          if (imageFiles.length === 0) {
-            event.target.value = '';
-            return;
-          }
-        }
+      const currentModelSupportsPdf = hasPdfSupport(selectedModel, isProUser);
+      if (pdfFiles.length > 0 && !currentModelSupportsPdf) {
+        console.warn('Current model may not have native PDF support — will attempt processing via document extraction');
       }
 
       let validFiles: File[] = [...imageFiles];
-      if (hasPdfSupport(selectedModel) || pdfFiles.length > 0) {
+      if (pdfFiles.length > 0) {
         validFiles = [...validFiles, ...pdfFiles];
       }
 
@@ -2969,7 +3012,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
       if (imageFiles.length > 0) {
         try {
           console.log('Checking image moderation for', imageFiles.length, 'images');
-          toast.info('Checking images for safety...');
 
           const imageDataURLs = await Promise.all(imageFiles.map((file) => fileToDataURL(file)));
 
@@ -2988,10 +3030,8 @@ const FormComponent: React.FC<FormComponentProps> = ({
 
           console.log('Images passed moderation check');
         } catch (error) {
-          console.error('Error during image moderation:', error);
-          toast.error('Unable to verify image safety. Please try again.');
-          event.target.value = '';
-          return;
+          // Moderation API failure should not block the upload — log and continue
+          console.error('Error during image moderation (non-fatal, proceeding with upload):', error);
         }
       }
 
@@ -3105,8 +3145,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
         return;
       }
 
-      toast.info(`Detected ${allFiles.length} dropped files`);
-
       const imageFiles: File[] = [];
       const pdfFiles: File[] = [];
       const unsupportedFiles: File[] = [];
@@ -3172,25 +3210,13 @@ const FormComponent: React.FC<FormComponentProps> = ({
         return;
       }
 
-      const currentModelData = models.find((m) => m.value === selectedModel);
-      if (pdfFiles.length > 0 && (!currentModelData || !currentModelData.pdf)) {
-        console.log('PDFs detected, switching to compatible model');
-
-        const compatibleModel = models.find((m) => m.pdf && m.vision);
-
-        if (compatibleModel) {
-          console.log('Switching to compatible model:', compatibleModel.value);
-          setSelectedModel(compatibleModel.value);
-          toast.info(`Switching to ${compatibleModel.label} to support PDF files`);
-        } else {
-          console.warn('No PDF-compatible model found');
-          toast.error('PDFs are only supported by Gemini and Claude models');
-          if (imageFiles.length === 0) return;
-        }
+      const currentModelSupportsPdf = hasPdfSupport(selectedModel, isProUser);
+      if (pdfFiles.length > 0 && !currentModelSupportsPdf) {
+        console.warn('Current model may not have native PDF support — will attempt processing via document extraction');
       }
 
       let validFiles: File[] = [...imageFiles];
-      if (hasPdfSupport(selectedModel) || pdfFiles.length > 0) {
+      if (pdfFiles.length > 0) {
         validFiles = [...validFiles, ...pdfFiles];
       }
 
@@ -3214,7 +3240,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
       if (imageFiles.length > 0) {
         try {
           console.log('Checking image moderation for', imageFiles.length, 'images');
-          toast.info('Checking images for safety...');
 
           const imageDataURLs = await Promise.all(imageFiles.map((file) => fileToDataURL(file)));
 
@@ -3232,32 +3257,19 @@ const FormComponent: React.FC<FormComponentProps> = ({
 
           console.log('Images passed moderation check');
         } catch (error) {
-          console.error('Error during image moderation:', error);
-          toast.error('Unable to verify image safety. Please try again.');
-          return;
+          // Moderation API failure should not block the upload — log and continue
+          console.error('Error during image moderation (non-fatal, proceeding with upload):', error);
         }
       }
 
-      if (!currentModelData?.vision) {
-        let visionModel: string;
-
-        if (pdfFiles.length > 0) {
-          const pdfCompatibleModel = models.find((m) => m.vision && m.pdf);
-          if (pdfCompatibleModel) {
-            visionModel = pdfCompatibleModel.value;
-          } else {
-            visionModel = getFirstVisionModel();
-          }
-        } else {
-          visionModel = getFirstVisionModel();
-        }
-
+      const currentDropModelData = models.find((m) => m.value === selectedModel);
+      if (imageFiles.length > 0 && !currentDropModelData?.vision) {
+        const visionModel = getFirstVisionModel();
         console.log('Switching to vision model:', visionModel);
         setSelectedModel(visionModel);
       }
 
       setUploadQueue(validFiles.map((file) => file.name));
-      toast.info(`Starting upload of ${validFiles.length} files...`);
 
       setTimeout(async () => {
         try {
@@ -3337,7 +3349,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
       if (filesToUpload.length > 0) {
         try {
           console.log('Checking image moderation for', filesToUpload.length, 'pasted images');
-          toast.info('Checking pasted images for safety...');
 
           const imageDataURLs = await Promise.all(filesToUpload.map((file) => fileToDataURL(file)));
 
@@ -3357,9 +3368,8 @@ const FormComponent: React.FC<FormComponentProps> = ({
 
           console.log('Pasted images passed moderation check');
         } catch (error) {
-          console.error('Error during pasted image moderation:', error);
-          toast.error('Unable to verify pasted image safety. Please try again.');
-          return;
+          // Moderation API failure should not block the upload — log and continue
+          console.error('Error during pasted image moderation (non-fatal, proceeding with upload):', error);
         }
       }
 
@@ -3396,16 +3406,9 @@ const FormComponent: React.FC<FormComponentProps> = ({
     }
   }, [status, inputRef]);
 
-  const updateChatUrl = useCallback((chatIdToAdd: string) => {
-    const currentPath = window.location.pathname;
-    if (currentPath === '/') {
-      window.history.pushState({}, '', `/search/${chatIdToAdd}`);
-      return;
-    }
-  }, []);
 
   const onSubmit = useCallback(
-    (event: React.FormEvent<HTMLFormElement>) => {
+    async (event: React.FormEvent<HTMLFormElement>) => {
       event.preventDefault();
 
       if (status !== 'ready') {
@@ -3431,6 +3434,21 @@ const FormComponent: React.FC<FormComponentProps> = ({
       }
 
       if (input.trim() || attachments.length > 0) {
+        // Run text moderation before sending
+        if (input.trim()) {
+          try {
+            const textModResult = await checkTextModeration(input.trim());
+            if (textModResult.violation) {
+              toast.error(
+                `Message content violates safety guidelines${textModResult.category ? ` (${textModResult.category})` : ''}. Please revise your message.`,
+              );
+              return;
+            }
+          } catch (error) {
+            console.error('Text moderation check failed:', error);
+          }
+        }
+
         track('model_selected', {
           model: selectedModel,
         });
@@ -3455,13 +3473,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
           ],
         });
 
-        // Update URL immediately after sending message for authenticated users
-        // This keeps the URL in sync without triggering Next.js navigation
-
-        if (user && typeof window !== 'undefined') {
-          updateChatUrl(chatId);
-        }
-
         setInput('');
         setAttachments([]);
         if (fileInputRef.current) {
@@ -3485,7 +3496,6 @@ const FormComponent: React.FC<FormComponentProps> = ({
       isLimitBlocked,
       user,
       isRecording,
-      chatId,
     ],
   );
 
@@ -3548,6 +3558,8 @@ const FormComponent: React.FC<FormComponentProps> = ({
             toast.error('Please wait for the response to complete!');
           } else if (isRecording) {
             toast.error('Please stop recording before submitting!');
+          } else if (uploadQueue.length > 0) {
+            toast.error('Please wait for the file upload to complete!');
           } else {
             const shouldBypassLimitsForThisModel = shouldBypassRateLimits(selectedModel, user);
             if (isLimitBlocked && !shouldBypassLimitsForThisModel) {
@@ -3562,7 +3574,7 @@ const FormComponent: React.FC<FormComponentProps> = ({
         }
       }
     },
-    [isProcessing, isRecording, selectedModel, user, isLimitBlocked, submitForm, inputRef, isMobile],
+    [isProcessing, isRecording, uploadQueue, selectedModel, user, isLimitBlocked, submitForm, inputRef, isMobile],
   );
 
   const resizeTextarea = useCallback(() => {
@@ -3697,11 +3709,11 @@ const FormComponent: React.FC<FormComponentProps> = ({
 
           {/* Form container */}
           <div className="relative">
-            {/* Shadow-like background blur effect */}
-            <div className="absolute -inset-1 rounded-2xl bg-primary/3 dark:bg-primary/3 blur-sm! pointer-events-none z-9999 shadow" />
+            {/* Ambient glow behind the form — skill: OLED neon glow */}
+            <div className="absolute -inset-1 rounded-2xl bg-primary/5 dark:bg-primary/8 blur-md pointer-events-none z-9999" />
             <div
               className={cn(
-                'relative rounded-xl bg-muted! border border-ring/10 focus-within:border-ring/5 transition-all duration-200',
+                'relative rounded-xl bg-muted! border border-border focus-within:border-primary/40 focus-within:shadow-[0_0_0_1px_color-mix(in_oklab,var(--primary)_20%,transparent)] transition-all duration-200',
                 (isEnhancing || isTypewriting) && 'bg-muted!',
               )}
             >
@@ -3817,15 +3829,17 @@ const FormComponent: React.FC<FormComponentProps> = ({
                 )}
               >
                 <div className={cn('flex items-center gap-2')}>
-                  <GroupModeToggle
-                    selectedGroup={selectedGroup}
-                    onGroupSelect={handleGroupSelect}
-                    status={status}
-                    onOpenSettings={onOpenSettings}
-                    isProUser={isProUser}
-                    isAuthenticated={!!user}
-                    usageData={usageData}
-                  />
+                  {supportsFunctionCalling(selectedModel) && (
+                    <GroupModeToggle
+                      selectedGroup={selectedGroup}
+                      onGroupSelect={handleGroupSelect}
+                      status={status}
+                      onOpenSettings={onOpenSettings}
+                      isProUser={isProUser}
+                      isAuthenticated={!!user}
+                      usageData={usageData}
+                    />
+                  )}
 
                   {selectedGroup === 'connectors' && setSelectedConnectors && (
                     <ConnectorSelector
@@ -3849,10 +3863,32 @@ const FormComponent: React.FC<FormComponentProps> = ({
                     user={user}
                     selectedGroup={selectedGroup}
                   />
+
+                  {!modelSupportsFunctionCalling && (
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="flex items-center text-amber-500/80 dark:text-amber-400/80 cursor-help ml-0.5">
+                          <Info size={13} />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent
+                        side="top"
+                        sideOffset={6}
+                        className="border-0 backdrop-blur-xs py-2 px-3 shadow-none! max-w-[200px]"
+                      >
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-medium text-[11px]">No search tools</span>
+                          <span className="text-[10px] text-accent leading-tight">
+                            Answers from training data only · may be outdated
+                          </span>
+                        </div>
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
                 </div>
 
                 <div className={cn('flex items-center shrink-0 gap-1')}>
-                  {hasVisionSupport(selectedModel) && (
+                  {!isMagpieModel && (
                     <Tooltip delayDuration={300}>
                       <TooltipTrigger asChild>
                         <Button
@@ -3881,7 +3917,7 @@ const FormComponent: React.FC<FormComponentProps> = ({
                         <div className="flex flex-col gap-0.5">
                           <span className="font-medium text-[11px]">Attach File</span>
                           <span className="text-[10px] text-accent leading-tight">
-                            {hasPdfSupport(selectedModel) ? 'Upload an image or PDF document' : 'Upload an image'}
+                            {hasPdfSupport(selectedModel, isProUser) ? 'Upload an image or PDF document' : 'Upload an image'}
                           </span>
                         </div>
                       </TooltipContent>
@@ -4073,6 +4109,10 @@ const FormComponent: React.FC<FormComponentProps> = ({
           </div>
         </div>
 
+        <p className="text-center text-xs text-muted-foreground/60 mt-1.5 px-2 select-none">
+          AI can make mistakes. Verify important information.
+        </p>
+
         {/* Pro Upgrade Dialog */}
         <Dialog open={showUpgradeDialog} onOpenChange={setShowUpgradeDialog}>
           <DialogContent className="p-0 overflow-hidden gap-0 bg-background sm:max-w-[450px]" showCloseButton={false}>
@@ -4160,7 +4200,7 @@ const FormComponent: React.FC<FormComponentProps> = ({
               <div className="flex items-center gap-4">
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div className="space-y-1">
-                  <p className="text-sm font-medium text-foreground">Scira Lookout</p>
+                  <p className="text-sm font-medium text-foreground">SCX.ai Lookout</p>
                   <p className="text-xs text-muted-foreground">Automated search monitoring on your schedule</p>
                 </div>
               </div>
@@ -4210,12 +4250,12 @@ const FormComponent: React.FC<FormComponentProps> = ({
                     </div>
                     <div className="flex flex-col gap-1 min-w-0 flex-1">
                       <span className="text-lg sm:text-xl font-bold">Sign in required</span>
-                      <span className="text-sm text-white/70 truncate">for Voice Input</span>
+                      <span className="text-sm text-white/70 truncate">to access this model</span>
                     </div>
                   </DialogTitle>
                   <DialogDescription className="text-white/90">
                     <p className="text-sm text-white/80 text-left">
-                      Voice input requires an account to access. Create an account to unlock this feature and more.
+                      Create a free account to unlock more models and features.
                     </p>
                   </DialogDescription>
                   <Button
@@ -4234,16 +4274,16 @@ const FormComponent: React.FC<FormComponentProps> = ({
               <div className="flex items-center gap-4">
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div>
-                  <p className="text-sm font-medium text-foreground">Voice Input</p>
-                  <p className="text-xs text-muted-foreground">Record and transcribe voice messages</p>
+                  <p className="text-sm font-medium text-foreground">SCX Coder</p>
+                  <p className="text-xs text-muted-foreground">197k context · reasoning · optimised for code</p>
                 </div>
               </div>
 
               <div className="flex items-center gap-4">
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div>
-                  <p className="text-sm font-medium text-foreground">Access better models</p>
-                  <p className="text-xs text-muted-foreground">GPT-5 Nano and more premium models</p>
+                  <p className="text-sm font-medium text-foreground">Access more models</p>
+                  <p className="text-xs text-muted-foreground">GPT-OSS 120B, SCX Coder, MAGPiE and more</p>
                 </div>
               </div>
 
@@ -4259,7 +4299,7 @@ const FormComponent: React.FC<FormComponentProps> = ({
                 <CheckIcon className="size-4 text-primary shrink-0" />
                 <div>
                   <p className="text-sm font-medium text-foreground">Free to start</p>
-                  <p className="text-xs text-muted-foreground">No payment required for basic features</p>
+                  <p className="text-xs text-muted-foreground">No payment required — Llama 4 is always free</p>
                 </div>
               </div>
 

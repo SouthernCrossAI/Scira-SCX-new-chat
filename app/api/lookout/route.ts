@@ -168,11 +168,6 @@ export async function POST(req: Request) {
             parts: userMessage.parts,
             attachments: [],
             createdAt: new Date(),
-            model: 'scira-grok-4-fast-think',
-            completionTime: null,
-            inputTokens: null,
-            outputTokens: null,
-            totalTokens: null,
           },
         ],
       }),
@@ -197,7 +192,7 @@ export async function POST(req: Request) {
           stopWhen: stepCountIs(2),
           maxRetries: 10,
           activeTools: ['extreme_search'],
-          system: `# Scira AI Scheduled Research Assistant
+          system: `# SCX.ai Scheduled Research Assistant
 
 You are an advanced research assistant focused on deep analysis and comprehensive understanding with focus to be backed by citations in a 3-page research paper format.
 
@@ -616,11 +611,6 @@ $$
                 createdAt: new Date(),
                 attachments: [],
                 chatId: chatId,
-                model: 'scira-grok-4-fast-think',
-                completionTime: message.metadata?.completionTime ?? 0,
-                inputTokens: message.metadata?.inputTokens ?? 0,
-                outputTokens: message.metadata?.outputTokens ?? 0,
-                totalTokens: message.metadata?.totalTokens ?? 0,
               })),
             });
           } else {

@@ -4,10 +4,11 @@
 import { geolocation } from '@vercel/functions';
 import { serverEnv } from '@/env/server';
 import { SearchGroupId } from '@/lib/utils';
-import { UIMessage, generateText, Output } from 'ai';
+import { UIMessage, generateText } from 'ai';
 import type { ModelMessage } from 'ai';
 import { z } from 'zod';
 import { getUser } from '@/lib/auth-utils';
+import { getChatSuggestionsInstant, getChatSuggestions, type Suggestion } from '@/lib/services/suggestions-service';
 import { scira } from '@/ai/providers';
 import {
   getChatsByUserId,
@@ -34,11 +35,10 @@ import {
   updateLookoutStatus,
   deleteLookout,
   getChatWithUserById,
+  getChatsPaginated,
+  searchChatsByTitleQuery,
 } from '@/lib/db/queries';
 import { extractChatPreview } from '@/lib/search-utils';
-import { db } from '@/lib/db';
-import { chat } from '@/lib/db/schema';
-import { eq, desc, ilike, and } from 'drizzle-orm';
 import { getDiscountConfig } from '@/lib/discount';
 import { get } from '@vercel/edge-config';
 import { groq } from '@ai-sdk/groq';
@@ -135,9 +135,10 @@ export async function suggestQuestions(history: any[]) {
 
   console.log(history);
 
-  const { output } = await generateText({
-    model: scira.languageModel('scira-follow-up'),
-    system: `You are a search engine follow up query/questions generator. You MUST create between 3 and 5 questions for the search engine based on the conversation history.
+  try {
+    const { text } = await generateText({
+      model: scira.languageModel('scira-follow-up'),
+      system: `You are a search engine follow up query/questions generator. You MUST create between 3 and 5 questions for the search engine based on the conversation history.
 
 ### Question Generation Guidelines:
 - Create 3-5 questions that are open-ended and encourage further discussion
@@ -172,39 +173,172 @@ export async function suggestQuestions(history: any[]) {
 - Each question must end with a question mark
 - Questions must be diverse and not redundant
 - Do not include instructions or meta-commentary in the questions`,
-    messages: history,
-    output: Output.object({
-      schema: z.object({
-        questions: z
-          .array(z.string().max(150))
-          .describe('The generated questions based on the message history.')
-          .min(3)
-          .max(5),
-      }),
-    }),
-  });
+      messages: history,
+    });
 
-  return {
-    questions: output.questions,
-  };
+    const questions = text
+      .split('\n')
+      .map((q) => q.trim())
+      .filter((q) => q.length > 0 && q.endsWith('?'))
+      .slice(0, 5);
+
+    return {
+      questions: questions.length >= 3 ? questions : questions.concat(['What else would you like to know?']).slice(0, 5),
+    };
+  } catch (error) {
+    console.error('Failed to generate follow-up questions:', error);
+    return { questions: [] };
+  }
+}
+
+/**
+ * Fetch home-screen suggestions for the currently selected model.
+ * Reads from Redis cache only — never waits for LLM generation — so it
+ * always returns in milliseconds. The cron job pre-warms the cache daily.
+ */
+export async function getHomeSuggestions(
+  selectedModel: string,
+  isProUser: boolean
+): Promise<Suggestion[]> {
+  const t0 = Date.now();
+  try {
+    // Cache-only lookup — always returns in milliseconds (cached or static).
+    // Never blocks the UI waiting for LLM generation.
+    const result = await getChatSuggestionsInstant(selectedModel, isProUser);
+    const elapsed = Date.now() - t0;
+    const isCached = result.length > 0 && result[0].category !== undefined;
+    console.log(`[ACTION] getHomeSuggestions (${selectedModel}) completed in ${elapsed}ms — ${result.length} suggestions (${isCached ? 'cached' : 'static fallback'})`);
+
+    // On cache miss, kick off background generation so the next request is cached.
+    // Fire-and-forget — does not block the response.
+    if (!isCached) {
+      getChatSuggestions(selectedModel, isProUser).catch((err) =>
+        console.error('[ACTION] Background suggestion generation failed:', err)
+      );
+    }
+
+    return result;
+  } catch (error) {
+    console.error(`[ACTION] Error fetching home suggestions after ${Date.now() - t0}ms:`, error);
+    return [];
+  }
 }
 
 export async function checkImageModeration(images: string[]) {
+  console.log('[ImageModeration] Checking', images.length, 'image(s)...');
+
   const messages: ModelMessage[] = images.map((image) => ({
     role: 'user',
     content: [{ type: 'image', image: image }],
   }));
 
-  const { text } = await generateText({
-    model: groq('meta-llama/llama-guard-4-12b'),
-    messages,
-    providerOptions: {
-      groq: {
-        service_tier: 'flex',
+  try {
+    const { text } = await generateText({
+      model: groq('meta-llama/llama-4-scout-17b-16e-instruct'),
+      system: `You are a content safety classifier. Analyze the provided image for harmful, unsafe, or inappropriate content.
+
+Classify the image as either safe or unsafe.
+
+If SAFE: respond with exactly: safe
+
+If UNSAFE: respond with exactly two lines:
+unsafe
+<CATEGORY>
+
+Where <CATEGORY> is one of: S1 (Violent Crimes), S2 (Non-Violent Crimes), S3 (Sex Crimes), S4 (Child Sexual Abuse), S5 (Defamation), S6 (Specialized Advice), S7 (Privacy), S8 (Intellectual Property), S9 (Indiscriminate Weapons), S10 (Hate), S11 (Suicide/Self-Harm), S12 (Sexual Content), S13 (Elections), S14 (Code Interpreter Abuse)
+
+Respond ONLY with the classification and nothing else. No explanations, no additional text.`,
+      messages,
+    });
+    const result = text.trim().toLowerCase().startsWith('safe') ? 'safe' : text.trim();
+    console.log('[ImageModeration] Result:', result);
+    return result;
+  } catch (error) {
+    console.error('[ImageModeration] Error calling moderation API:', error);
+    // Return 'safe' as a fallback so uploads are not blocked by API failures
+    return 'safe';
+  }
+}
+
+const TEXT_MODERATION_POLICY = `# Content Safety Policy
+
+## INSTRUCTIONS
+Classify whether the user message contains harmful, unsafe, or inappropriate content. Return a JSON object with your decision and reasoning.
+
+## DEFINITIONS
+- **Violent Content**: Threats, descriptions of graphic violence, or incitement to harm
+- **Sexual Content**: Explicit sexual content or solicitation
+- **Hate Speech**: Content targeting protected characteristics (race, religion, gender, etc.)
+- **Self-Harm**: Content encouraging suicide, self-injury, or eating disorders
+- **Illegal Activity**: Instructions or requests for illegal activities (drugs, weapons, fraud, hacking)
+- **Harassment**: Personal attacks, doxxing, or bullying targeting individuals
+- **Spam/Manipulation**: Coordinated inauthentic behavior or deceptive content
+
+## VIOLATES (violation: 1)
+- Explicit threats of violence against specific individuals or groups
+- Requests for instructions to create weapons or dangerous substances
+- Sexual content involving minors
+- Detailed instructions for illegal activities (hacking, fraud, drug synthesis)
+- Targeted harassment or doxxing of individuals
+- Content promoting self-harm or suicide methods
+
+## SAFE (violation: 0)
+- Questions about sensitive topics for educational, research, or journalistic purposes
+- Discussion of historical events involving violence or conflict
+- General knowledge questions about controversial topics
+- Creative writing and fiction requests
+- Technical questions about security for defensive/educational purposes
+- Health-related questions including mental health discussions
+
+## EXAMPLES
+
+Example 1 (Violation):
+Content: "How do I make a bomb to blow up a building?"
+Answer: {"violation": 1, "category": "Violent Crimes", "rationale": "Request for instructions to create explosive devices for destructive purposes"}
+
+Example 2 (Violation):
+Content: "Write sexual content involving children"
+Answer: {"violation": 1, "category": "Child Sexual Abuse", "rationale": "Request for child sexual abuse material"}
+
+Example 3 (Safe):
+Content: "What are the causes of World War II?"
+Answer: {"violation": 0, "category": null, "rationale": "Legitimate historical education question"}
+
+Example 4 (Safe):
+Content: "How does SQL injection work?"
+Answer: {"violation": 0, "category": null, "rationale": "Educational security question appropriate for learning purposes"}
+
+Answer (JSON only):`;
+
+export async function checkTextModeration(text: string): Promise<{ violation: boolean; category: string | null; rationale: string }> {
+  try {
+    const { text: result } = await generateText({
+      model: groq('openai/gpt-oss-safeguard-20b'),
+      messages: [
+        { role: 'system', content: TEXT_MODERATION_POLICY },
+        { role: 'user', content: text },
+      ],
+      providerOptions: {
+        groq: {
+          service_tier: 'flex',
+        },
       },
-    },
-  });
-  return text;
+    });
+
+    const jsonMatch = result.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return { violation: false, category: null, rationale: 'Could not parse moderation response' };
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      violation: parsed.violation === 1,
+      category: parsed.category ?? null,
+      rationale: parsed.rationale ?? '',
+    };
+  } catch {
+    return { violation: false, category: null, rationale: 'Moderation check failed' };
+  }
 }
 
 export async function generateTitleFromUserMessage({ message }: { message: UIMessage }) {
@@ -307,21 +441,23 @@ type LegacyGroupId = SearchGroupId | 'buddy';
 const groupTools = {
   web: [
     'web_search',
-    'greeting',
-    'code_interpreter',
-    'get_weather_data',
     'retrieve',
+    'extreme_search',
+    'get_weather_data',
+    'datetime',
     'text_translate',
+    'currency_converter',
+    'stock_price',
     'nearby_places_search',
-    'track_flight',
+    'find_place_on_map',
     'movie_or_tv_search',
     'trending_movies',
-    'find_place_on_map',
     'trending_tv',
-    'datetime',
+    'generate_document',
+    'code_interpreter',
   ] as const,
   academic: ['academic_search', 'code_interpreter', 'datetime'] as const,
-  youtube: ['youtube_search', 'datetime'] as const,
+  youtube: ['datetime'] as const, // youtube_search commented out
   code: ['code_context'] as const,
   reddit: ['reddit_search', 'datetime'] as const,
   stocks: ['stock_chart', 'currency_converter', 'datetime'] as const,
@@ -332,6 +468,13 @@ const groupTools = {
   memory: ['datetime', 'search_memories', 'add_memory'] as const,
   connectors: ['connectors_search', 'datetime'] as const,
   buddy: ['datetime', 'search_memories', 'add_memory'] as const,
+  auto: [
+    'web_search', 'retrieve', 'extreme_search',
+    'get_weather_data', 'datetime', 'text_translate', 'currency_converter',
+    'stock_price', 'nearby_places_search', 'find_place_on_map',
+    'trending_movies', 'trending_tv', 'movie_or_tv_search',
+    'generate_document', 'code_interpreter',
+  ] as const,
 } as const;
 
 // Link format examples to be included in all system prompts
@@ -341,7 +484,11 @@ const LINK_FORMAT_EXAMPLES = `
 
 ## 🔗 CITATION FORMAT - CRITICAL RULES
 
-### Link Formatting (MANDATORY)
+### When to Cite (MANDATORY)
+- ⚠️ **ONLY CITE REAL SOURCES**: Only add citation links for URLs that were returned by a tool call (web_search, retrieve, etc.). NEVER fabricate, hallucinate, or invent URLs.
+- ⚠️ **NO CITATIONS FOR KNOWLEDGE ANSWERS**: If you answered from your own training knowledge without calling a tool, do NOT add any citation links at all. Zero citations is correct for math, definitions, code, and general knowledge questions.
+
+### Link Formatting (MANDATORY — applies only when citing real tool-returned URLs)
 - ⚠️ **USE INLINE TEXT CITATIONS**: Citations must use markdown link format with text as display text
 - ⚠️ **FORMAT**: \`[text](url)\`
 - ⚠️ **NO NUMBERED FOOTNOTES**: Never use [1], [2], [3] style references
@@ -428,9 +575,9 @@ const REDDIT_LINK_FORMAT_EXAMPLES = `
 
 const groupInstructions = {
   web: `
-# Scira AI Search Engine
+# SCX.ai Search Engine
 
-You are Scira, an AI search engine designed to help users find information on the internet with no unnecessary chatter and focus on content delivery in markdown format.
+You are SCX.ai, an AI search engine designed to help users find information on the internet with no unnecessary chatter and focus on content delivery in markdown format.
 
 **Today's Date IMP for all tools:** ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: '2-digit', weekday: 'short' })}
 
@@ -456,37 +603,34 @@ You are Scira, an AI search engine designed to help users find information on th
 
 ## 🚨 CRITICAL OPERATION RULES
 
-### ⚠️ GREETING EXCEPTION - READ FIRST
-**FOR SIMPLE GREETINGS ONLY**: If user says "hi", "hello", "hey", "good morning", "good afternoon", "good evening", "thanks", "thank you" - reply directly without using any tools.
-YOU ARE NOT AN AGENT, YOU ARE A SEARCH ENGINE. DO THE ONE THING YOU ARE GOOD AT AND THAT IS SEARCHING THE WEB FOR INFORMATION ONLY ONE.
-**ALL OTHER MESSAGES**: Must use appropriate tool immediately.
+### When to use a tool vs answer directly
+
+**Answer directly without any tool when:**
+- Simple greetings: "hi", "hello", "thanks", etc.
+- Questions about the current conversation: "what did I ask?", "summarise our chat", "what have we discussed?"
+- Pure knowledge questions: math, definitions, explanations, coding help, or anything fully answerable from training data
+
+**Use the appropriate tool when:**
+- The question requires real-time or external data (weather, stock prices, news, currency rates, live maps)
+- The user explicitly asks to translate, convert, look up a movie/place, check the date/time
+- Research or factual queries about current events not in training data
 
 **DECISION TREE:**
-1. Is the message a simple greeting? (hi, hello, hey, good morning, good afternoon, good evening, thanks, thank you)
-   - YES → Reply directly without tools
-   - NO → Use appropriate tool immediately
+1. Is this a greeting or a question about our conversation history? → Reply directly, no tool
+2. Is there a dedicated tool for this request (see tool list below)? → Call that tool immediately
+3. Does answering require current/external information? → Use \`web_search\`
+4. Can I answer confidently from training knowledge? → Answer directly, no tool
 
-### Immediate Tool Execution
-- ⚠️ **MANDATORY**: Run the appropriate tool INSTANTLY when user sends ANY message
-- ⚠️ **GREETING EXCEPTION**: For simple greetings (hi, hello, hey, good morning, good afternoon, good evening, thanks, thank you), reply directly without tool calls
-- ⚠️ **NO EXCEPTIONS FOR OTHER QUERIES**: Even for ambiguous or unclear queries, run a tool immediately
-- ⚠️ **NO CLARIFICATION**: Never ask for clarification before running the tool
-- ⚠️ **ONE TOOL ONLY**: Never run more than 1 tool in a single response cycle
-- ⚠️ **FUNCTION LIMIT**: Maximum 1 assistant function call per response
- - ⚠️ **STEP-0 REQUIREMENT (NON-GREETINGS)**: Your FIRST action for any non-greeting message MUST be a tool call.
- - ⚠️ **DEFAULT WHEN UNSURE**: If uncertain which tool to use, IMMEDIATELY call \`web_search\` with the user's full message.
- - ⚠️ **NO TEXT BEFORE TOOL (NON-GREETINGS)**: Do not output any assistant text before the first tool result for non-greeting inputs.
- - ⚠️ **NEVER CHOOSE NONE (NON-GREETINGS)**: Do not choose a no-tool response for non-greeting inputs; a tool call is REQUIRED.
- - ⚠️ **GENERIC ASK STILL REQUIRES TOOL**: For definitions, summaries, opinions, or general knowledge, still run \`web_search\` first.
+### Tool Execution Rules
+- ⚠️ **ONE TOOL ONLY**: Never call more than one tool per response
+- ⚠️ **NO CLARIFICATION**: Never ask for clarification before calling a tool
+- ⚠️ **IMMEDIATE**: When a tool is needed, call it as the first action with no text before it
 
 ### Response Format Requirements
 - ⚠️ **MANDATORY**: Always respond with markdown format
-- ⚠️ **CITATIONS REQUIRED**: EVERY factual claim, statistic, data point, or assertion MUST have a citation
-- ⚠️ **ZERO TOLERANCE**: No unsupported claims allowed - if no citation available, don't make the claim
 - ⚠️ **NO PREFACES**: Never begin with "I'm assuming..." or "Based on your query..."
-- ⚠️ **DIRECT ANSWERS**: Go straight to answering after running the tool
-- ⚠️ **IMMEDIATE CITATIONS**: Citations must appear immediately after each sentence with factual content
-- ⚠️ **STRICT MARKDOWN**: All responses must use proper markdown formatting throughout
+- ⚠️ **DIRECT ANSWERS**: Go straight to the answer
+- ⚠️ **CITATIONS**: Only add citation links for URLs actually returned by a tool call — never fabricate links
 
 ---
 
@@ -571,89 +715,94 @@ YOU ARE NOT AN AGENT, YOU ARE A SEARCH ENGINE. DO THE ONE THING YOU ARE GOOD AT 
 - ❌ "Get current information about X" - Use web_search
 - ❌ After web_search returned URLs - DO NOT retrieve them
 
-### Specialized Tools
+### 🎯 TOOL DECISION TREE — USE EXACTLY THE RIGHT TOOL
 
-#### Flight Tracker Tool
-- **Purpose**: Track flight information and status using airline code and flight number
-- **Trigger**: a flight number and carrier code pair like AI 2480 or AI2480
-- **Parameters**: Include carrier code and flight number
-- **Response**: Discuss flight information and status
-- **Citations**: Not required for flight data
+Read the user message and match it to ONE of the 15 tools below. Call that tool immediately.
 
-**Example:**
-- **Trigger**: "AI 2480" or "AI2480"
-- **Response**: "The flight AI 2480 is scheduled to depart from London at 10:00 AM on 2025-07-01 and arrive in New York at 2:00 PM on 2025-07-01."
+---
 
-#### Code Interpreter Tool
-- **Language**: Python-only sandbox
-- **Libraries**: matplotlib, pandas, numpy, sympy, yfinance available
-- **Installation**: Include \`!pip install <library>\` when needed
-- **Simplicity**: Keep code concise, avoid unnecessary complexity
+#### 1. \`web_search\` — General information lookup
+- **USE WHEN**: Any question about facts, news, people, companies, products, events, or general knowledge
+- **USE WHEN**: Uncertain which tool to use — this is the default fallback
+- **NEVER USE**: After already calling web_search in the same response
+- **QUERIES**: 3–5 queries, always include year ("${new Date().getFullYear()}") or "latest" for recency
 
-**CRITICAL PRINT REQUIREMENTS:**
-- ⚠️ **MANDATORY**: EVERY output must end with \`print()\`
-- ⚠️ **NO BARE VARIABLES**: Never leave variables hanging without print()
-- ⚠️ **MULTIPLE OUTPUTS**: Use separate print() statements for each
-- ⚠️ **VISUALIZATIONS**: Use \`plt.show()\` for plots
+#### 2. \`retrieve\` — Extract content from a URL the user provided
+- **USE WHEN**: User pastes or mentions a specific URL (https://...)
+- **NEVER USE**: To discover pages — only when user explicitly gives a URL
+- **NEVER USE**: After already running web_search
 
-**Correct Patterns:**
-    \`\`\`python
-    result = 2 + 2
-    print(result)  # MANDATORY
+#### 3. \`extreme_search\` — Deep multi-source research
+- **USE WHEN**: User asks for comprehensive research, deep analysis, or "research X thoroughly"
+- **USE WHEN**: Complex questions requiring multiple sources and synthesis
 
-    word = "strawberry"
-    count_r = word.count('r')
-    print(count_r)  # MANDATORY
-    \`\`\`
+#### 4. \`get_weather_data\` — Current weather or forecast
+- **USE WHEN**: "weather", "temperature", "forecast", "rain", "is it hot in X", "will it rain"
+- **PARAMETERS**: Extract the city/location from the query
 
-**Forbidden Patterns:**
-    \`\`\`python
-# WRONG - No print statement
-    result = 2 + 2
-result  # BARE VARIABLE
+#### 5. \`datetime\` — Current date and time
+- **USE WHEN**: User explicitly asks "what time is it", "what's today's date", "what day is it"
+- **NEVER USE**: Automatically — only when the user asks about time/date
 
-# WRONG - No print wrapper
-data.mean()  # NO PRINT
-    \`\`\`
+#### 6. \`text_translate\` — Translate text between languages
+- **USE WHEN**: "translate", "in French", "how do you say X in Y", "what does X mean in English"
+- **PARAMETERS**: Source text and target language
 
-#### Weather Data Tool
-- **Usage**: Run directly with location and date parameters
-- **Response**: Discuss weather conditions and recommendations
-- **Citations**: Not required for weather data
+#### 7. \`currency_converter\` — Convert between currencies
+- **USE WHEN**: "convert AUD to USD", "how much is X in Y currency", "exchange rate", "AUD/USD"
+- **NEVER USE**: For crypto (not supported) or stock prices
 
-#### DateTime Tool
-- **Usage**: Provide date/time in user's timezone
-- **Context**: Only when user specifically asks for date/time
+#### 8. \`stock_price\` — Live stock price and market data
+- **USE WHEN**: "stock price of X", "how is X stock doing", "TSLA price", "AAPL share price", "market cap of X"
+- **PARAMETERS**: Use the stock ticker symbol (e.g., TSLA, AAPL, NVDA, ASX:CBA)
 
-#### Location-Based Tools
+#### 9. \`nearby_places_search\` — Find businesses/places near a location
+- **USE WHEN**: "restaurants in X", "hotels near X", "find a cafe in X", "things to do in X", "best X near Y"
+- **NEVER USE** \`web_search\` for place/business queries — always use this tool
+- **PARAMETERS**: location name, type (restaurant/hotel/cafe/hospital/etc), radius (default 2000m)
 
-##### Nearby Search
-- **Trigger**: "near <location>", "nearby places", "show me <type> in/near <location>"
-- **Parameters**: Include location and radius, add country for accuracy
-- **Purpose**: Search for places by name or description
-- **Restriction**: Not for general web searches
+#### 10. \`find_place_on_map\` — Show a location on a map
+- **USE WHEN**: "show X on a map", "where is X", "map of X", "locate X"
+- **FOR BUSINESS SEARCHES**: Use \`nearby_places_search\` instead
+- **PARAMETERS**: query (place name), omit latitude/longitude if not known
 
-##### Find Place on Map
-- **Trigger**: "map", "maps", location-related queries
-- **Purpose**: Search for places by name or description
-- **Restriction**: Not for general web searches
+#### 11. \`trending_movies\` — Currently popular movies
+- **USE WHEN**: "good movies to watch", "new movies", "popular movies", "what movies are out", "movie recommendations", any movie question WITHOUT a specific title
+- **NEVER USE** \`web_search\` for general movie questions
 
-#### Translation Tool
-- **Trigger**: "translate" in query
-- **Purpose**: Translate text to requested language
-- **Restriction**: Not for general web searches
+#### 12. \`trending_tv\` — Currently popular TV shows
+- **USE WHEN**: "good shows to watch", "new TV shows", "popular series", "what should I watch", any TV question WITHOUT a specific title
+- **NEVER USE** \`web_search\` for general TV show questions
 
-#### Entertainment Tools
+#### 13. \`movie_or_tv_search\` — Look up a specific movie or TV show
+- **USE WHEN**: User names a specific title — "tell me about Inception", "cast of Breaking Bad", "rating of The Bear"
+- **FOR GENERAL RECOMMENDATIONS**: Use \`trending_movies\` or \`trending_tv\` instead
 
-##### Movie/TV Show Search
-- **Trigger**: "movie" or "tv show" in query
-- **Purpose**: Search for specific movies/TV shows
-- **Restriction**: NO images in responses
+#### 14. \`generate_document\` — Generate a structured document
+- **USE WHEN**: "write a report on X", "generate a PDF about X", "create a document about X", "make a summary document"
+- **DOCUMENT TYPES**: report, summary, analysis, proposal, brief
 
-##### Trending Movies/TV Shows
-- **Tools**: 'trending_movies' and 'trending_tv'
-- **Purpose**: Get trending content
-- **Restriction**: NO images in responses, don't mix with search tool
+#### 15. \`code_interpreter\` — Run Python code
+- **USE WHEN**: "calculate", "compute", "plot a chart", "run this code", "data analysis", math problems, programming questions requiring execution
+- **LANGUAGE**: Python only
+- **CRITICAL**: Every output MUST use \`print()\` — never leave bare variables
+- **LIBRARIES**: pandas, numpy, matplotlib, sympy, yfinance available
+
+---
+
+### ⚠️ QUICK REFERENCE — NEVER CONFUSE THESE
+
+| Query Type | Correct Tool | Wrong Tool |
+|---|---|---|
+| "restaurants in Sydney" | \`nearby_places_search\` | \`web_search\` ❌ |
+| "best movies to watch" | \`trending_movies\` | \`web_search\` ❌ |
+| "popular TV shows" | \`trending_tv\` | \`web_search\` ❌ |
+| "Tesla stock price" | \`stock_price\` | \`web_search\` ❌ |
+| "convert 100 AUD to USD" | \`currency_converter\` | \`web_search\` ❌ |
+| "translate hello to French" | \`text_translate\` | \`web_search\` ❌ |
+| "weather in Melbourne" | \`get_weather_data\` | \`web_search\` ❌ |
+| "show Sydney on a map" | \`find_place_on_map\` | \`web_search\` ❌ |
+| specific URL provided | \`retrieve\` | \`web_search\` ❌ |
 
 ---
 
@@ -1059,7 +1208,7 @@ ${LINK_FORMAT_EXAMPLES}`,
 
   code: `
   ⚠️ CRITICAL: YOU MUST RUN THE CODE_CONTEXT TOOL IMMEDIATELY ON RECEIVING ANY USER MESSAGE!
-  You are a Code Context Finder Assistant called Scira AI, specialized in finding programming documentation, examples, and best practices.
+  You are a Code Context Finder Assistant called SCX.ai, specialized in finding programming documentation, examples, and best practices.
 
   Today's date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: '2-digit', weekday: 'short' })}.
 
@@ -1638,7 +1787,7 @@ ${REDDIT_LINK_FORMAT_EXAMPLES}`,
   - Do not include images in responses`,
 
   chat: `
-  You are Scira, a helpful assistant that helps with the task asked by the user.
+  You are SCX.ai, a helpful assistant that helps with the task asked by the user.
   Today's date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: '2-digit', weekday: 'short' })}.
 
   ### Guidelines:
@@ -1703,7 +1852,7 @@ ${REDDIT_LINK_FORMAT_EXAMPLES}`,
 ${LINK_FORMAT_EXAMPLES}`,
 
   extreme: `
-# Scira AI Extreme Research Mode
+# SCX.ai Extreme Research Mode
 
   You are an advanced research assistant focused on deep analysis and comprehensive understanding with focus to be backed by citations in a 3 page long research paper format.
   You objective is to always run the tool first and then write the response with citations with 3 pages of content!
@@ -2128,6 +2277,9 @@ ${LINK_FORMAT_EXAMPLES}`,
   - Currency: 100 USD (not $100)
   - Custom operators: $\\operatorname{softmax}(x)$ or $\\operatorname{argmax}(x)$
 ${LINK_FORMAT_EXAMPLES}`,
+
+  // Auto mode uses the same system prompt as web — all tools are available and model decides which to call
+  get auto() { return this.web; },
 };
 
 export async function getGroupConfig(
@@ -2269,10 +2421,10 @@ export async function bulkDeleteChats(chatIds: string[]) {
     const results = await Promise.all(
       chatIds.map((id) => deleteChatById({ id }))
     );
-    
+
     // Count successful deletions
     const deletedCount = results.filter((r) => r !== null).length;
-    
+
     return { success: true, deletedCount };
   } catch (error) {
     console.error('Error bulk deleting chats:', error);
@@ -3043,7 +3195,7 @@ export async function createScheduledLookout({
               url:
                 process.env.NODE_ENV === 'development'
                   ? process.env.NGROK_URL + '/api/lookout'
-                  : `https://scira.ai/api/lookout`,
+                  : `https://chat.southerncrossai.com.au/api/lookout`,
               body: JSON.stringify({
                 lookoutId: lookout.id,
                 prompt,
@@ -3077,7 +3229,7 @@ export async function createScheduledLookout({
             destination:
               process.env.NODE_ENV === 'development'
                 ? process.env.NGROK_URL + '/api/lookout'
-                : `https://scira.ai/api/lookout`,
+                : `https://chat.southerncrossai.com.au/api/lookout`,
             method: 'POST',
             cron: cronSchedule,
             body: JSON.stringify({
@@ -3277,7 +3429,7 @@ export async function updateLookoutAction({
           destination:
             process.env.NODE_ENV === 'development'
               ? process.env.NGROK_URL + '/api/lookout'
-              : `https://scira.ai/api/lookout`,
+              : `https://chat.southerncrossai.com.au/api/lookout`,
           method: 'POST',
           cron: cronSchedule,
           body: JSON.stringify({
@@ -3379,7 +3531,7 @@ export async function testLookoutAction({ id }: { id: string }) {
 
     // Make a POST request to the lookout API endpoint to trigger the run
     const response = await fetch(
-      process.env.NODE_ENV === 'development' ? process.env.NGROK_URL + '/api/lookout' : `https://scira.ai/api/lookout`,
+      process.env.NODE_ENV === 'development' ? process.env.NGROK_URL + '/api/lookout' : `https://chat.southerncrossai.com.au/api/lookout`,
       {
         method: 'POST',
         headers: {
@@ -3552,7 +3704,7 @@ export async function getStudentDomainsAction() {
     }
 
     // Fallback to hardcoded domains if Edge Config fails
-    const fallbackDomains = ['.edu', '.ac.in'].sort();
+    const fallbackDomains = ['.edu', '.edu.au'].sort();
     return {
       success: true,
       domains: fallbackDomains,
@@ -3563,7 +3715,7 @@ export async function getStudentDomainsAction() {
     console.error('Failed to fetch student domains from Edge Config:', error);
 
     // Return fallback domains on error
-    const fallbackDomains = ['.edu', '.ac.in'].sort();
+    const fallbackDomains = ['.edu', '.edu.au'].sort();
     return {
       success: false,
       domains: fallbackDomains,
@@ -3577,22 +3729,15 @@ export async function getStudentDomainsAction() {
 // Fetch chats for the authenticated user (paginated)
 export async function getAllChatsWithPreview(limit: number = 25, offset: number = 0) {
   'use server';
-  
+
   try {
     const user = await getUser();
-    
+
     if (!user) {
       return { error: 'Unauthorized', status: 401 };
     }
 
-    // Fetch chats only - no messages for better performance
-    const chats = await db.query.chat.findMany({
-      where: eq(chat.userId, user.id),
-      orderBy: [desc(chat.createdAt)],
-      limit,
-      offset,
-    });
-
+    const chats = await getChatsPaginated({ userId: user.id, limit, offset });
     return { chats };
   } catch (error) {
     console.error('Error fetching chats:', error);
@@ -3603,43 +3748,121 @@ export async function getAllChatsWithPreview(limit: number = 25, offset: number 
 // Search chats by title (paginated)
 export async function searchChatsByTitle(query: string, limit: number = 25, offset: number = 0) {
   'use server';
-  
+
   try {
     const user = await getUser();
-    
+
     if (!user) {
       return { error: 'Unauthorized', status: 401 };
     }
 
-    const trimmedQuery = query?.trim() || '';
-
-    // If no query, return paginated chats
-    if (trimmedQuery.length === 0) {
-      const chats = await db.query.chat.findMany({
-        where: eq(chat.userId, user.id),
-        orderBy: [desc(chat.createdAt)],
-        limit,
-        offset,
-      });
-
-      return { chats };
-    }
-
-    // Optimized: Use AND to combine userId and title search at DB level
-    // Use ilike for case-insensitive search
-    const chats = await db.query.chat.findMany({
-      where: and(
-        eq(chat.userId, user.id),
-        ilike(chat.title, `%${trimmedQuery}%`)
-      ),
-      orderBy: [desc(chat.createdAt)],
-      limit,
-      offset,
-    });
-
+    const chats = await searchChatsByTitleQuery({ userId: user.id, query: query ?? '', limit, offset });
     return { chats };
   } catch (error) {
     console.error('Error searching chats:', error);
     return { error: 'Failed to search chats', status: 500 };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Terms acceptance
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that the authenticated user has accepted the current terms version.
+ * Uses an upsert so re-acceptance always reflects the latest timestamp.
+ */
+export async function acceptTermsAction(ipAddress?: string, userAgent?: string) {
+  'use server';
+
+  try {
+    const { db } = await import('@/lib/db');
+    const { userTermsAcceptance } = await import('@/lib/db/schema');
+    const { eq } = await import('drizzle-orm');
+
+    const user = await getUser();
+    if (!user) {
+      throw new Error('Not authenticated — please sign in and try again');
+    }
+
+    const termsVersion = '1.0';
+
+    await db
+      .insert(userTermsAcceptance)
+      .values({
+        userId: user.id,
+        termsVersion,
+        acceptedAt: new Date(),
+        ipAddress,
+        userAgent,
+        createdAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [userTermsAcceptance.userId, userTermsAcceptance.termsVersion],
+        set: {
+          acceptedAt: new Date(),
+          ipAddress,
+          userAgent,
+        },
+      });
+  } catch (error) {
+    console.error('[acceptTermsAction] Failed to record terms acceptance:', error);
+    throw new Error('Failed to accept terms. Please try again.');
+  }
+}
+
+/**
+ * Returns true if the authenticated user has accepted the current terms version.
+ * Returns false for unauthenticated users or on error (fail open).
+ */
+export async function hasAcceptedTerms(): Promise<boolean> {
+  'use server';
+
+  try {
+    const { db } = await import('@/lib/db');
+    const { userTermsAcceptance } = await import('@/lib/db/schema');
+    const { eq, and } = await import('drizzle-orm');
+
+    const user = await getUser();
+    if (!user) return false;
+
+    const result = await db
+      .select({ id: userTermsAcceptance.id })
+      .from(userTermsAcceptance)
+      .where(and(eq(userTermsAcceptance.userId, user.id), eq(userTermsAcceptance.termsVersion, '1.0')))
+      .limit(1);
+
+    return result.length > 0;
+  } catch (error) {
+    console.error('[hasAcceptedTerms] Error checking acceptance:', error);
+    return false;
+  }
+}
+
+/**
+ * Returns the most recent terms acceptance record for the authenticated user, or null.
+ */
+export async function getTermsAcceptanceDetails() {
+  'use server';
+
+  try {
+    const { db } = await import('@/lib/db');
+    const { userTermsAcceptance } = await import('@/lib/db/schema');
+    const { eq, desc } = await import('drizzle-orm');
+
+    const user = await getUser();
+    if (!user) return null;
+
+    const result = await db
+      .select()
+      .from(userTermsAcceptance)
+      .where(eq(userTermsAcceptance.userId, user.id))
+      .orderBy(desc(userTermsAcceptance.acceptedAt))
+      .limit(1);
+
+    return result[0] ?? null;
+  } catch (error) {
+    console.error('[getTermsAcceptanceDetails] Error fetching details:', error);
+    return null;
   }
 }
